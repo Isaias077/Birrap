@@ -10,12 +10,68 @@ const colors = {ambos:"#e9be6f",modis:"#a7bcf6",viirs:"#a5d8ae"};
 const reference = 4;
 let data,geo,worker,lastComputed,rows=[],selected=null,start="",end="",region="",threshold=1,month;
 let daily={}, cells={}, combined=[], known=new Set(), viewport={scale:1,x:0,y:0}, drag, targets=[];
-let mapWidth=0,mapHeight=0;
+let mapWidth=0,mapHeight=0,lastProj=null;
+let area=null,drawMode=false,boxDrag=null,fireScale="day",fcMonth=null,fcYear=null,fireRange=null;
 const map=$("map"), chart=$("chart");
 const checkedWithoutData=new Set();
 const sorted=(a,b)=>a.localeCompare(b,"es");
 const dayISO=d=>d.toISOString().slice(0,10);
 const dayObject=d=>new Date(d+"T12:00:00Z");
+function inArea(lat,lon){
+  if(!area)return true;
+  if(area.type==="box")return lat>=area.minLat&&lat<=area.maxLat&&lon>=area.minLon&&lon<=area.maxLon;
+  const [, ,kx,ky]=data.grid;
+  return Math.hypot((lon-area.lon)*kx,(lat-area.lat)*ky)<=area.rKm;
+}
+function cellInArea(gx,gy){
+  if(!area)return true;
+  const [west,south,kx,ky,cell]=data.grid;
+  return inArea(south+(gy+.5)*cell/ky,west+(gx+.5)*cell/kx);
+}
+function dateMatch(d){
+  if(selected)return d===selected;
+  if(fireRange)return d.startsWith(fireRange);
+  return true;
+}
+function setDrawMode(on){
+  drawMode=on;
+  map.classList.toggle("drawing",on);
+  $("map-hint").hidden=!on;
+  for(const id of ["draw-btn","draw-map"])$(id).setAttribute("aria-pressed",String(on));
+  $("draw-btn").textContent=on?"Cancelá con Esc":"Marcar zona en el mapa";
+}
+function focusBounds(minLon,maxLon,minLat,maxLat){
+  if(!geo)return;
+  const visible=region?geo.features.filter(f=>f.properties.nombre===region):geo.features;
+  const coords=visible.flatMap(f=>polygons(f).flat(2));
+  const xmin=Math.min(...coords.map(p=>p[0])),xmax=Math.max(...coords.map(p=>p[0]));
+  const ymin=Math.min(...coords.map(p=>p[1])),ymax=Math.max(...coords.map(p=>p[1]));
+  const lonCorr=.86,w=mapWidth||map.clientWidth||700,h=mapHeight||map.clientHeight||445;
+  const base=Math.min((w-64)/((xmax-xmin)*lonCorr),(h-54)/(ymax-ymin));
+  const spanLon=Math.max(0.08,(maxLon-minLon)*1.6),spanLat=Math.max(0.08,(maxLat-minLat)*1.6);
+  const scale=Math.min(36,Math.max(1,Math.min((w-80)/(spanLon*base*lonCorr),(h-80)/(spanLat*base))));
+  const cLon=(minLon+maxLon)/2,cLat=(minLat+maxLat)/2;
+  viewport={scale,x:-(cLon-(xmin+xmax)/2)*base*lonCorr*scale,y:-((ymin+ymax)/2-cLat)*base*scale};
+}
+function updateAreaStatus(){
+  const el=$("area-status");
+  $("clear-area").disabled=!area;
+  el.classList.remove("warn");
+  if(!area){
+    el.textContent="Ingresá coordenadas o marcá una zona en el mapa para filtrar los resultados.";
+    return;
+  }
+  const desc=area.type==="circle"
+    ? "Punto ("+fmt(area.lat)+"°, "+fmt(area.lon)+"°) · radio "+fmt(area.rKm)+" km"
+    : "Zona ["+fmt(area.minLat)+"° a "+fmt(area.maxLat)+"° lat, "+fmt(area.minLon)+"° a "+fmt(area.maxLon)+"° lon]";
+  const [west,south,kx,ky,cell]=data.grid;
+  const maxLon=west+900*cell/kx,maxLat=south+900*cell/ky;
+  const out=area.type==="circle"
+    ? (area.lat<south||area.lat>maxLat||area.lon<west||area.lon>maxLon)
+    : (area.maxLat<south||area.minLat>maxLat||area.maxLon<west||area.minLon>maxLon);
+  if(out)el.classList.add("warn");
+  el.textContent=desc+" · "+num(rows.length)+" detecciones y "+num(cells.ambos?.ref.length||0)+" celdas activas × día en el intervalo."+(out?" (Fuera o al borde de la grilla de San Juan)":"");
+}
 function showTable(target, headers, values){
   const table=document.createElement("table"), head=table.createTHead().insertRow();
   for(const h of headers){const th=document.createElement("th");th.scope="col";th.textContent=h;head.append(th);}
@@ -54,11 +110,14 @@ function apply(){
   const previousRegion=region;
   start=a;end=b;region=$("region").value;threshold=Number($("threshold").value);
   if(selected && (selected<start||selected>end))selected=null;
+  if(fireRange && (fireRange>end.slice(0,fireRange.length)||fireRange<start.slice(0,fireRange.length)))fireRange=null;
   month=dayObject(selected||[...known][0]||start);
-  rows=data.rows.filter(r=>r[1]>=start&&r[1]<=end&&(!region||r[10]===region));
+  if(!fcMonth||fcMonth< dayObject(start.slice(0,7)+"-01")||fcMonth>dayObject(end.slice(0,7)+"-01"))fcMonth=new Date(month);
+  if(!fcYear)fcYear=month.getUTCFullYear();
+  rows=data.rows.filter(r=>r[1]>=start&&r[1]<=end&&(!region||r[10]===region)&&inArea(r[2],r[3]));
   cells={};daily={};
   for(const mode of modes){
-    const fine=data.products[mode].filter(r=>known.has(data.dates[r[0]])&&(!region||r[4]===region));
+    const fine=data.products[mode].filter(r=>known.has(data.dates[r[0]])&&(!region||r[4]===region)&&cellInArea(r[1],r[2]));
     cells[mode]={fine,ref:aggregate(fine,reference).filter(r=>r[3]>=threshold)};
     daily[mode]=new Map();
     for(const r of fine){
@@ -84,7 +143,8 @@ function apply(){
   dateQuery.updateLink($("other-source"),inArchive,"historico.html",a,b,region);
   for(const id of ["export-summary","export-cells","export-raw","export-map","export-chart"]) $(id).disabled=!hasData;
   if(previousRegion!==region)viewport={scale:1,x:0,y:0};
-  renderCalendar();renderMap();renderChart();renderTables();
+  updateAreaStatus();
+  renderCalendar();renderFireCalendar();renderMap();renderChart();renderTables();
 }
 function renderCalendar(){
   $("month-name").textContent=new Intl.DateTimeFormat("es-AR",{month:"long",year:"numeric",timeZone:"UTC"}).format(month);
@@ -103,10 +163,121 @@ function renderCalendar(){
     btn.setAttribute("aria-label",dateLabel(key)+" · "+(value?num(value)+" celdas activas":known.has(key)?"sin celdas activas estimadas, cobertura sin verificar":"fuera de los datos cargados"));
     const b=document.createElement("b"), s=document.createElement("span");b.textContent=d.getUTCDate();s.textContent=value?num(value):"—";btn.append(b,s);
     if(value)btn.style.background=heat(value,max,0.85);
-    btn.onclick=()=>{selected=key===selected?null:key;renderCalendar();renderMap();};
+    btn.onclick=()=>{fireRange=null;selected=key===selected?null:key;renderCalendar();renderFireCalendar();renderMap();};
     items.push(btn);
   }
   $("calendar").replaceChildren(...items);
+}
+function renderFireCalendar(){
+  if(!data||!start)return;
+  const grid=$("fire-calendar");
+  grid.className="fire-grid "+fireScale;
+  const byDay=new Map(),byMonth=new Map(),byYear=new Map();
+  const cDay=new Map(),cMonth=new Map(),cYear=new Map();
+  for(const r of rows){
+    const d=r[1],m=d.slice(0,7),y=d.slice(0,4);
+    byDay.set(d,(byDay.get(d)||0)+1);
+    byMonth.set(m,(byMonth.get(m)||0)+1);
+    byYear.set(y,(byYear.get(y)||0)+1);
+  }
+  for(const [d,v] of daily.ambos.entries()){
+    if(!v.active)continue;
+    const m=d.slice(0,7),y=d.slice(0,4);
+    cDay.set(d,(cDay.get(d)||0)+v.active);
+    cMonth.set(m,(cMonth.get(m)||0)+v.active);
+    cYear.set(y,(cYear.get(y)||0)+v.active);
+  }
+  const items=[];
+  if(fireScale==="day"){
+    $("fc-title").textContent=new Intl.DateTimeFormat("es-AR",{month:"long",year:"numeric",timeZone:"UTC"}).format(fcMonth);
+    $("fc-prev").disabled=false;$("fc-next").disabled=false;
+    const first=new Date(fcMonth);first.setUTCDate(1);
+    const max=Math.max(1,...byDay.values(),...cDay.values());
+    for(const name of ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]){
+      const el=document.createElement("span");el.className="weekday";el.textContent=name;items.push(el);
+    }
+    for(let i=0;i<(first.getUTCDay()+6)%7;i++)items.push(document.createElement("span"));
+    let mFocos=0,mCeldas=0;
+    for(let d=new Date(first);d.getUTCMonth()===first.getUTCMonth();d.setUTCDate(d.getUTCDate()+1)){
+      const key=dayISO(d),inRange=key>=start&&key<=end&&known.has(key);
+      const focos=byDay.get(key)||0,celdas=cDay.get(key)||0;
+      if(inRange){mFocos+=focos;mCeldas+=celdas;}
+      const btn=document.createElement("button");
+      btn.type="button";
+      btn.className="fcell"+(selected===key?" selected":"")+(!inRange?" out":"");
+      btn.disabled=!inRange;
+      const b=document.createElement("b"),st=document.createElement("strong"),sm=document.createElement("small");
+      b.textContent=d.getUTCDate();
+      st.textContent=inRange?num(focos):"—";
+      sm.textContent=inRange?(focos===1?"1 foco":num(focos)+" focos")+(celdas?" · "+num(celdas)+" cel.":""):"sin datos";
+      btn.append(b,st,sm);
+      if(focos||celdas)btn.style.background=heat(focos||celdas,max,0.85);
+      btn.onclick=()=>{
+        fireRange=null;selected=selected===key?null:key;
+        month=dayObject(key);
+        renderCalendar();renderFireCalendar();renderMap();
+      };
+      items.push(btn);
+    }
+    $("fc-summary").textContent="Mes visible: "+num(mFocos)+" focos detectados · "+num(mCeldas)+" celdas activas × día. Hacé clic en un día para filtrarlo en el mapa.";
+  }else if(fireScale==="month"){
+    $("fc-title").textContent="Año "+fcYear;
+    $("fc-prev").disabled=false;$("fc-next").disabled=false;
+    const max=Math.max(1,...byMonth.values(),...cMonth.values());
+    const mNames=["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
+    let yFocos=0,yCeldas=0;
+    for(let m=0;m<12;m++){
+      const key=fcYear+"-"+String(m+1).padStart(2,"0");
+      const hasKnown=[...known].some(d=>d.startsWith(key));
+      const focos=byMonth.get(key)||0,celdas=cMonth.get(key)||0;
+      yFocos+=focos;yCeldas+=celdas;
+      const btn=document.createElement("button");
+      btn.type="button";
+      btn.className="fcell"+(fireRange===key?" selected":"")+(!hasKnown?" out":"");
+      btn.disabled=!hasKnown;
+      const b=document.createElement("b"),st=document.createElement("strong"),sm=document.createElement("small");
+      b.textContent=mNames[m];
+      st.textContent=hasKnown?num(focos):"—";
+      sm.textContent=hasKnown?num(focos)+" focos · "+num(celdas)+" cel.":"sin datos";
+      btn.append(b,st,sm);
+      if(focos||celdas)btn.style.background=heat(focos||celdas,max,0.85);
+      btn.onclick=()=>{
+        selected=null;fireRange=fireRange===key?null:key;
+        fcMonth=dayObject(key+"-01");month=new Date(fcMonth);
+        renderCalendar();renderFireCalendar();renderMap();
+      };
+      items.push(btn);
+    }
+    $("fc-summary").textContent="Año "+fcYear+": "+num(yFocos)+" focos detectados · "+num(yCeldas)+" celdas activas × día. Hacé clic en un mes para filtrarlo en el mapa.";
+  }else{
+    const years=[...new Set([start.slice(0,4),end.slice(0,4),...[...known].map(d=>d.slice(0,4))])].sort();
+    const y0=Math.min(...years.map(Number))-1,y1=Math.max(...years.map(Number))+1;
+    $("fc-title").textContent=y0+" – "+y1;
+    $("fc-prev").disabled=true;$("fc-next").disabled=true;
+    const max=Math.max(1,...byYear.values(),...cYear.values());
+    for(let y=y0;y<=y1;y++){
+      const key=String(y),hasKnown=[...known].some(d=>d.startsWith(key));
+      const focos=byYear.get(key)||0,celdas=cYear.get(key)||0;
+      const btn=document.createElement("button");
+      btn.type="button";
+      btn.className="fcell"+(fireRange===key?" selected":"")+(!hasKnown?" out":"");
+      btn.disabled=!hasKnown;
+      const b=document.createElement("b"),st=document.createElement("strong"),sm=document.createElement("small");
+      b.textContent=key;
+      st.textContent=hasKnown?num(focos):"—";
+      sm.textContent=hasKnown?num(focos)+" focos · "+num(celdas)+" cel.":"sin datos";
+      btn.append(b,st,sm);
+      if(focos||celdas)btn.style.background=heat(focos||celdas,max,0.85);
+      btn.onclick=()=>{
+        selected=null;fireRange=fireRange===key?null:key;
+        fcYear=y;
+        renderCalendar();renderFireCalendar();renderMap();
+      };
+      items.push(btn);
+    }
+    $("fc-summary").textContent="Total en el intervalo: "+num(rows.length)+" focos detectados. Hacé clic en un año para filtrarlo en el mapa.";
+  }
+  grid.replaceChildren(...items);
 }
 function heat(v,max,alpha=1){
   const t=Math.log1p(v)/Math.log1p(Math.max(max,1));
@@ -124,6 +295,8 @@ function renderMap(){
   const lonCorr=.86;
   const base=Math.min((w-64)/((xmax-xmin)*lonCorr),(h-54)/(ymax-ymin));
   const toXY=(lon,lat)=>[w/2+viewport.x+(lon-(xmin+xmax)/2)*base*lonCorr*viewport.scale,h/2+viewport.y+((ymin+ymax)/2-lat)*base*viewport.scale];
+  const toLonLat=(x,y)=>[(xmin+xmax)/2+(x-w/2-viewport.x)/(base*lonCorr*viewport.scale),(ymin+ymax)/2-(y-h/2-viewport.y)/(base*viewport.scale)];
+  lastProj={toXY,toLonLat,base,lonCorr};
   ctx.fillStyle="#101b1c";ctx.fillRect(0,0,w,h);
   ctx.strokeStyle="#263636";ctx.lineWidth=1;
   for(let x=0;x<w;x+=31){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
@@ -145,7 +318,7 @@ function renderMap(){
   const observed=setting.startsWith("obs")||(setting==="auto"&&width375>=9);
   const approx=setting==="auto"&&observed;
   const mode=modes.includes(setting)?setting:"ambos";
-  const dateOk=d=>!selected||d===selected;
+  const dateOk=dateMatch;
   const resolution=width375<.7?32:width375<2?16:width375<5?4:1;
   if(observed){
     const focus=rows.filter(r=>dateOk(r[1])&&(setting==="obs-modis"?r[5]==="MODIS":setting==="obs-viirs"?r[5]==="VIIRS":true));
@@ -193,7 +366,31 @@ function renderMap(){
     ctx.strokeStyle="#162122";ctx.lineWidth=3;ctx.strokeText(f.properties.nombre,x,y);
     ctx.fillStyle="#a3b3a7";ctx.fillText(f.properties.nombre,x,y);
   }
-  $("map-date").textContent=selected?dateLabel(selected):dateLabel(start)+" al "+dateLabel(end);
+  if(area){
+    const [ , ,kx,ky]=data.grid;
+    ctx.save();
+    ctx.strokeStyle="#d3e690";ctx.fillStyle="rgba(211,230,144,0.12)";ctx.lineWidth=1.8;ctx.setLineDash([5,4]);
+    if(area.type==="box"){
+      const [x1,y1]=toXY(area.minLon,area.maxLat),[x2,y2]=toXY(area.maxLon,area.minLat);
+      ctx.fillRect(x1,y1,x2-x1,y2-y1);ctx.strokeRect(x1,y1,x2-x1,y2-y1);
+    }else{
+      const [cx,cy]=toXY(area.lon,area.lat);
+      const rx=area.rKm/kx*base*lonCorr*viewport.scale,ry=area.rKm/ky*base*viewport.scale;
+      ctx.beginPath();ctx.ellipse(cx,cy,Math.max(4,rx),Math.max(4,ry),0,0,Math.PI*2);ctx.fill();ctx.stroke();
+      ctx.setLineDash([]);ctx.fillStyle="#d3e690";
+      ctx.beginPath();ctx.arc(cx,cy,4,0,Math.PI*2);ctx.fill();
+    }
+    ctx.restore();
+  }
+  if(boxDrag){
+    ctx.save();
+    const x=Math.min(boxDrag.x0,boxDrag.x1),y=Math.min(boxDrag.y0,boxDrag.y1);
+    const bw=Math.abs(boxDrag.x1-boxDrag.x0),bh=Math.abs(boxDrag.y1-boxDrag.y0);
+    ctx.fillStyle="rgba(211,230,144,0.18)";ctx.strokeStyle="#d3e690";ctx.lineWidth=1.5;ctx.setLineDash([4,3]);
+    ctx.fillRect(x,y,bw,bh);ctx.strokeRect(x,y,bw,bh);
+    ctx.restore();
+  }
+  $("map-date").textContent=selected?dateLabel(selected):fireRange?"Filtro: "+fireRange:dateLabel(start)+" al "+dateLabel(end);
 }
 function renderChart(){
   if(!start)return;
@@ -264,16 +461,45 @@ function csv(filename,cols,items){
   const url=URL.createObjectURL(blob);download(url,filename);setTimeout(()=>URL.revokeObjectURL(url),2000);
 }
 function download(url,name){const a=document.createElement("a");a.href=url;a.download=name;a.click();}
-map.onpointerdown=e=>{map.setPointerCapture(e.pointerId);drag={x:e.offsetX,y:e.offsetY,vx:viewport.x,vy:viewport.y};};
-map.onpointermove=e=>{if(!drag)return;viewport.x=drag.vx+e.offsetX-drag.x;viewport.y=drag.vy+e.offsetY-drag.y;renderMap();};
+map.onpointerdown=e=>{
+  map.setPointerCapture(e.pointerId);
+  if(drawMode||e.shiftKey){
+    boxDrag={x0:e.offsetX,y0:e.offsetY,x1:e.offsetX,y1:e.offsetY};
+    return;
+  }
+  drag={x:e.offsetX,y:e.offsetY,vx:viewport.x,vy:viewport.y};
+};
+map.onpointermove=e=>{
+  if(boxDrag){boxDrag.x1=e.offsetX;boxDrag.y1=e.offsetY;renderMap();return;}
+  if(!drag)return;
+  viewport.x=drag.vx+e.offsetX-drag.x;viewport.y=drag.vy+e.offsetY-drag.y;renderMap();
+};
 map.onpointerup=e=>{
+  if(boxDrag){
+    const {x0,y0,x1,y1}=boxDrag;boxDrag=null;setDrawMode(false);
+    if(lastProj&&Math.hypot(x1-x0,y1-y0)>=6){
+      const [lonA,latA]=lastProj.toLonLat(x0,y0),[lonB,latB]=lastProj.toLonLat(x1,y1);
+      area={type:"box",minLat:Math.min(latA,latB),maxLat:Math.max(latA,latB),minLon:Math.min(lonA,lonB),maxLon:Math.max(lonA,lonB)};
+      $("lat").value=((area.minLat+area.maxLat)/2).toFixed(4);
+      $("lon").value=((area.minLon+area.maxLon)/2).toFixed(4);
+      apply();
+    }else if(lastProj){
+      const [lon,lat]=lastProj.toLonLat(x1,y1);
+      const rKm=Math.max(0.1,Number($("radius").value)||10);
+      area={type:"circle",lat,lon,rKm};
+      $("lat").value=lat.toFixed(4);$("lon").value=lon.toFixed(4);
+      apply();
+    }else renderMap();
+    return;
+  }
   if(drag&&Math.hypot(e.offsetX-drag.x,e.offsetY-drag.y)<5){
     const hit=targets.findLast(([x,y,w,h])=>e.offsetX>=x-2&&e.offsetX<=x+w+2&&e.offsetY>=y-2&&e.offsetY<=y+h+2);
-    $("inspect").textContent=hit?.[4]||"Sin celdas activas ni detecciones en este punto para la capa seleccionada.";
+    const coords=lastProj?(()=>{const [lon,lat]=lastProj.toLonLat(e.offsetX,e.offsetY);return " ("+fmt(lat)+"°, "+fmt(lon)+"°)";})():"";
+    $("inspect").textContent=(hit?.[4]||"Sin celdas activas ni detecciones en este punto para la capa seleccionada.")+coords;
   }
   drag=null;
 };
-map.onpointercancel=()=>{drag=null;};
+map.onpointercancel=()=>{drag=null;boxDrag=null;};
 map.ondblclick=e=>zoom(2,e.offsetX,e.offsetY);
 map.addEventListener("wheel",e=>{e.preventDefault();zoom(e.deltaY<0?1.25:.8,e.offsetX,e.offsetY);},{passive:false});
 map.addEventListener("keydown",e=>{
@@ -287,9 +513,47 @@ $("home").onclick=()=>{viewport={scale:1,x:0,y:0};renderMap();};
 $("layer").onchange=renderMap;
 $("prev").onclick=()=>{if(!month)return;month.setUTCDate(1);month.setUTCMonth(month.getUTCMonth()-1);renderCalendar();};
 $("next").onclick=()=>{if(!month)return;month.setUTCDate(1);month.setUTCMonth(month.getUTCMonth()+1);renderCalendar();};
-$("all-days").onclick=()=>{if(!start)return;selected=null;renderCalendar();renderMap();};
+$("all-days").onclick=()=>{if(!start)return;selected=null;fireRange=null;renderCalendar();renderFireCalendar();renderMap();};
 $("filters").onsubmit=e=>{e.preventDefault();apply();downloadMissing();};
 $("filters").onchange=apply;
+$("area-form").onsubmit=e=>{
+  e.preventDefault();
+  const lat=parseFloat($("lat").value),lon=parseFloat($("lon").value),rKm=Math.max(0.1,parseFloat($("radius").value)||10);
+  if(!Number.isFinite(lat)||!Number.isFinite(lon)||lat<-90||lat>90||lon<-180||lon>180){
+    $("area-status").classList.add("warn");
+    $("area-status").textContent="Ingresá una latitud (entre -90 y 90) y longitud (entre -180 y 180) válidas.";
+    return;
+  }
+  setDrawMode(false);
+  area={type:"circle",lat,lon,rKm};
+  const [, ,kx,ky]=data.grid;
+  focusBounds(lon-rKm/kx,lon+rKm/kx,lat-rKm/ky,lat+rKm/ky);
+  apply();
+};
+$("draw-btn").onclick=()=>setDrawMode(!drawMode);
+$("draw-map").onclick=()=>setDrawMode(!drawMode);
+$("clear-area").onclick=()=>{
+  area=null;setDrawMode(false);
+  $("lat").value="";$("lon").value="";
+  viewport={scale:1,x:0,y:0};
+  apply();
+};
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&drawMode){setDrawMode(false);boxDrag=null;renderMap();}});
+for(const btn of document.querySelectorAll("#incendios [data-scale]")){
+  btn.onclick=()=>{
+    fireScale=btn.dataset.scale;
+    for(const b of document.querySelectorAll("#incendios [data-scale]"))b.setAttribute("aria-pressed",String(b===btn));
+    renderFireCalendar();
+  };
+}
+$("fc-prev").onclick=()=>{
+  if(fireScale==="day"&&fcMonth){fcMonth.setUTCDate(1);fcMonth.setUTCMonth(fcMonth.getUTCMonth()-1);renderFireCalendar();}
+  else if(fireScale==="month"&&fcYear){fcYear--;renderFireCalendar();}
+};
+$("fc-next").onclick=()=>{
+  if(fireScale==="day"&&fcMonth){fcMonth.setUTCDate(1);fcMonth.setUTCMonth(fcMonth.getUTCMonth()+1);renderFireCalendar();}
+  else if(fireScale==="month"&&fcYear){fcYear++;renderFireCalendar();}
+};
 
 function addResults(extra) {
   if(!data || !Array.isArray(extra?.dates) || !extra.dates.length ||
