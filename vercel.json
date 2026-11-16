@@ -1,21 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "services": {
-    "app": {
-      "root": ".",
-      "runtime": "python"
-    },
-    "laboratorio_original": {
-      "root": "laboratorio_original",
-      "runtime": "python"
-    }
-  },
-  "rewrites": [
-    {
-      "source": "/(.*)",
-      "destination": {
-        "service": "app"
-      }
-    }
-  ]
+  "framework": null,
+  "outputDirectory": "web",
+  "installCommand": "npm install",
+  "buildCommand": "node scripts/build.mjs"
 }
