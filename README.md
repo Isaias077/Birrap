@@ -13,6 +13,12 @@ Abrí http://127.0.0.1:8080. Para activar la descarga automática, copiá `.env.
 
 El directorio `laboratorio_original/` conserva el código, ejemplos y pruebas del paquete original. La aplicación actual usa `web/`, `worker/` y los scripts Python de la raíz.
 
+## Despliegue en Vercel
+
+`vercel.json` define dos servicios: `web` (sitio estático de `web/`, público en `/`) y `api` (función Node de `api/`, pública en `/api/*`, atiende `POST /api/firms`). El navegador llama a `/api/firms` en el mismo dominio, así que no hacen falta bindings. Configurá `FIRMS_MAP_KEY` como variable de entorno del proyecto en Vercel. Para probar localmente: `vercel dev`.
+
+La lógica del proxy FIRMS vive en `api/firms.js` y `scripts/build.mjs` la incrusta en el Worker de `dist/`. Los scripts Python y `laboratorio_original/` son herramientas offline y no se despliegan como servicios.
+
 ## Piloto LETKF
 
 Datos originales de los productos públicos FIRMS NRT de MODIS, NOAA-20 y NOAA-21 del 8 al 15 de noviembre de 2026 (último día parcial). El CSV S-NPP descargado solo contenía encabezado para la descarga seleccionada. Las observaciones se recortan por el límite departamental de Georef/IGN. Para la asimilación se aplican filtros de confianza, FRP positivo y tipo de anomalía si la fuente lo trae. La descarga web conserva las filas originales normalizadas que entraron al recorte, incluidas las descartadas por esos filtros.
